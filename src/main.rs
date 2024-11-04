@@ -1,27 +1,20 @@
 use ::reqwest::Url;
 use anyhow::Context;
 use core::str;
-use nom::{
-    branch::alt,
-    bytes::streaming::take,
-    character::streaming::{char, i64, u64},
-    multi::many0,
-    sequence::{delimited, terminated, tuple},
-    IResult,
-};
+use decode::{decode_bencoded_value, Decoded};
 use rand::RngCore;
 use reqwest::blocking as reqwest;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{
-    collections::HashMap,
     env,
-    fmt::Display,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
-    ops::Index,
+    path::Path,
     str::FromStr,
 };
+
+pub mod decode;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PeersResponse {
@@ -74,144 +67,50 @@ where
     )
 }
 
-#[derive(Debug, Clone)]
-pub struct Decoded<'a> {
-    pub source: &'a [u8],
-    pub kind: DecodedKind<'a>,
+fn get_peers(data: Torrent, info_hash: [u8; 20]) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut url = Url::from_str(&data.announce)?;
+    url.query_pairs_mut()
+        .append_pair("info_hash", unsafe { str::from_utf8_unchecked(&info_hash) })
+        .append_pair("peer_id", "20 chars is too shor")
+        .append_pair("port", "6881")
+        .append_pair("uploaded", "0")
+        .append_pair("downloaded", "0")
+        .append_pair("left", &data.info.length.to_string())
+        .append_pair("compact", "1");
+    let res = reqwest::get(url)?;
+    let text = res.bytes()?;
+    let (_, res) = decode_bencoded_value(&text).unwrap();
+    let res: PeersResponse = serde(&res)?;
+
+    Ok(res.peers().collect())
 }
 
-impl Serialize for Decoded<'_> {
-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.kind.serialize(s)
-    }
-}
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum DecodedKind<'a> {
-    Bytes(&'a [u8]),
-    String(&'a str),
-    Int(i64),
-    List(Vec<Decoded<'a>>),
-    Dict(HashMap<&'a str, Decoded<'a>>),
-}
+fn perform_handshake(addr: SocketAddr, info_hash: [u8; 20]) -> anyhow::Result<[u8; 20]> {
+    let mut tcp = TcpStream::connect(addr)?;
+    let prot_str = b"BitTorrent protocol";
+    tcp.write_all(&[prot_str.len() as u8])?;
+    tcp.write_all(prot_str)?;
+    tcp.write_all(&[0; 8])?;
+    tcp.write_all(&info_hash)?;
+    let mut my_id = [0; 20];
+    rand::thread_rng().fill_bytes(&mut my_id);
+    tcp.write_all(&my_id)?;
+    eprintln!("my_id = {:02x?}", my_id);
 
-impl<'a> DecodedKind<'a> {
-    pub fn into_decoded(self, source: &'a [u8]) -> Decoded<'a> {
-        Decoded { source, kind: self }
-    }
-}
+    let mut buf = [0; 20];
+    tcp.read_exact(&mut buf)?;
+    assert_eq!(buf[0], 19);
+    assert_eq!(buf[1..], *prot_str);
+    let mut buf = [0; 8];
+    tcp.read_exact(&mut buf)?;
+    let mut buf = [0; 20];
+    tcp.read_exact(&mut buf)?;
+    assert_eq!(&buf[..], &info_hash[..]);
+    let mut peer_id = [0; 20];
+    tcp.read_exact(&mut peer_id)?;
+    eprintln!("Peer ID: {}", hex::encode(peer_id));
 
-impl<'a> Index<&'_ str> for Decoded<'a> {
-    type Output = Decoded<'a>;
-
-    fn index(&self, index: &'_ str) -> &Self::Output {
-        match &self.kind {
-            DecodedKind::Dict(d) => &d[index],
-            _ => panic!("Cannot index with string into type other than dictionary"),
-        }
-    }
-}
-
-impl<'a> Index<usize> for Decoded<'a> {
-    type Output = Decoded<'a>;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        match &self.kind {
-            DecodedKind::List(d) => &d[index],
-            _ => panic!("Cannot index with usize into type other than list"),
-        }
-    }
-}
-
-impl Display for Decoded<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.kind {
-            DecodedKind::Bytes(b) => {
-                write!(f, "0x")?;
-                for b in b.iter() {
-                    write!(f, "{:02x}", b)?;
-                }
-                Ok(())
-            }
-            DecodedKind::String(s) => write!(f, "{}", s),
-            DecodedKind::Int(n) => write!(f, "{}", n),
-            DecodedKind::List(l) => {
-                write!(f, "[")?;
-                for (i, d) in l.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", d)?;
-                }
-                write!(f, "]")
-            }
-            DecodedKind::Dict(l) => {
-                write!(f, "{{")?;
-                for (i, (key, value)) in l.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}: {}", key, value)?;
-                }
-                write!(f, "}}")
-            }
-        }
-    }
-}
-
-fn string(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
-    let (rest, len) = terminated(u64, char(':'))(encoded)?;
-    let (rest, s) = take(len)(rest)?;
-    let source = encoded
-        .strip_suffix(rest)
-        .expect("rest is the end of `encoded`");
-    if let Ok(string) = std::str::from_utf8(s) {
-        Ok((rest, DecodedKind::String(string).into_decoded(source)))
-    } else {
-        Ok((rest, DecodedKind::Bytes(s).into_decoded(source)))
-    }
-}
-
-fn int(encoded: &[u8]) -> IResult<&[u8], Decoded> {
-    let (rest, n) = delimited(char('i'), i64, char('e'))(encoded)?;
-    let slice = encoded
-        .strip_suffix(rest)
-        .expect("rest is the end of `encoded`");
-    Ok((rest, DecodedKind::Int(n).into_decoded(slice)))
-}
-
-fn list(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
-    let (rest, vec) = delimited(char('l'), many0(decode_bencoded_value), char('e'))(encoded)?;
-    let slice = encoded
-        .strip_suffix(rest)
-        .expect("rest is the end of `encoded`");
-    Ok((rest, DecodedKind::List(vec).into_decoded(slice)))
-}
-
-fn dict_entry(encoded: &[u8]) -> IResult<&[u8], (&str, Decoded<'_>)> {
-    let (rest, (key, value)) = tuple((string, decode_bencoded_value))(encoded)?;
-    let DecodedKind::String(key) = key.kind else {
-        panic!("should always be string");
-    };
-    Ok((rest, (key, value)))
-}
-
-fn dict(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
-    let (rest, vec) = delimited(char('d'), many0(dict_entry), char('e'))(encoded)?;
-    let slice = encoded
-        .strip_suffix(rest)
-        .expect("rest is the end of `encoded`");
-    Ok((
-        rest,
-        DecodedKind::Dict(vec.into_iter().collect()).into_decoded(slice),
-    ))
-}
-
-fn decode_bencoded_value(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
-    alt((string, int, list, dict))(encoded)
+    Ok(peer_id)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -220,8 +119,7 @@ fn main() -> anyhow::Result<()> {
     match &*args[1] {
         "decode" => {
             let (_, value) = decode_bencoded_value(&args[2].as_bytes()).unwrap();
-            dbg!(&value);
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            println!("{}", serde_json::to_string(&value)?);
         }
         "info" => {
             let file = std::fs::read(&args[2])?;
@@ -259,24 +157,9 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("{}", hex::encode(piece));
             }
 
-            let mut url = Url::from_str(&data.announce)?;
-            url.query_pairs_mut()
-                .append_pair("info_hash", unsafe { str::from_utf8_unchecked(&info_hash) })
-                .append_pair("peer_id", "20 chars is too shor")
-                .append_pair("port", "6881")
-                .append_pair("uploaded", "0")
-                .append_pair("downloaded", "0")
-                .append_pair("left", &data.info.length.to_string())
-                .append_pair("compact", "1");
-            dbg!(url.to_string());
-            let res = reqwest::get(url)?;
-            let text = res.bytes()?;
-            dbg!(&text);
-            let (_, res) = decode_bencoded_value(&text).unwrap();
-            let res: PeersResponse = serde(&res)?;
-            dbg!(&res);
+            let peers = get_peers(data, info_hash.into())?;
 
-            for peer in res.peers() {
+            for peer in peers {
                 println!("{}", peer);
             }
         }
@@ -293,29 +176,8 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("{}", hex::encode(piece));
             }
 
-            let mut tcp = TcpStream::connect(addr)?;
-            let prot_str = b"BitTorrent protocol";
-            tcp.write_all(&[prot_str.len() as u8])?;
-            tcp.write_all(prot_str)?;
-            tcp.write_all(&[0; 8])?;
-            tcp.write_all(&info_hash)?;
-            let mut my_id = [0; 20];
-            rand::thread_rng().fill_bytes(&mut my_id);
-            tcp.write_all(&my_id)?;
-            eprintln!("my_id = {:02x?}", my_id);
-
-            let mut buf = [0; 20];
-            tcp.read_exact(&mut buf)?;
-            assert_eq!(buf[0], 19);
-            assert_eq!(buf[1..], *prot_str);
-            let mut buf = [0; 8];
-            tcp.read_exact(&mut buf)?;
-            let mut buf = [0; 20];
-            tcp.read_exact(&mut buf)?;
-            assert_eq!(&buf[..], &info_hash[..]);
-            let mut peer_id = [0; 20];
-            tcp.read_exact(&mut peer_id)?;
-            println!("Peer ID: {}", hex::encode(peer_id));
+            let peer_id = perform_handshake(addr, info_hash.into())?;
+            eprintln!("Peer ID: {}", hex::encode(peer_id));
         }
         command => {
             panic!("Unknown command '{}'", command)
