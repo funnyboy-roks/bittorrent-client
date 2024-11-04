@@ -9,6 +9,7 @@ use nom::{
     sequence::{delimited, terminated, tuple},
     IResult,
 };
+use rand::RngCore;
 use reqwest::blocking as reqwest;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -16,8 +17,8 @@ use std::{
     collections::HashMap,
     env,
     fmt::Display,
-    io::Read,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    io::{Read, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     ops::Index,
     str::FromStr,
 };
@@ -278,6 +279,43 @@ fn main() -> anyhow::Result<()> {
             for peer in res.peers() {
                 println!("{}", peer);
             }
+        }
+        "handshake" => {
+            let file = std::fs::read(&args[2])?;
+            let addr: SocketAddr = args[3].parse()?;
+            let (_, value) = decode_bencoded_value(&file).unwrap();
+            let data: Torrent = serde(&value)?;
+            let mut hasher = Sha1::new();
+            hasher.update(value["info"].source);
+            let info_hash = hasher.finalize();
+
+            for piece in data.info.pieces() {
+                eprintln!("{}", hex::encode(piece));
+            }
+
+            let mut tcp = TcpStream::connect(addr)?;
+            let prot_str = b"BitTorrent protocol";
+            tcp.write_all(&[prot_str.len() as u8])?;
+            tcp.write_all(prot_str)?;
+            tcp.write_all(&[0; 8])?;
+            tcp.write_all(&info_hash)?;
+            let mut my_id = [0; 20];
+            rand::thread_rng().fill_bytes(&mut my_id);
+            tcp.write_all(&my_id)?;
+            eprintln!("my_id = {:02x?}", my_id);
+
+            let mut buf = [0; 20];
+            tcp.read_exact(&mut buf)?;
+            assert_eq!(buf[0], 19);
+            assert_eq!(buf[1..], *prot_str);
+            let mut buf = [0; 8];
+            tcp.read_exact(&mut buf)?;
+            let mut buf = [0; 20];
+            tcp.read_exact(&mut buf)?;
+            assert_eq!(&buf[..], &info_hash[..]);
+            let mut peer_id = [0; 20];
+            tcp.read_exact(&mut peer_id)?;
+            println!("Peer ID: {}", hex::encode(peer_id));
         }
         command => {
             panic!("Unknown command '{}'", command)
