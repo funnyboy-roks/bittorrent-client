@@ -3,8 +3,9 @@ use anyhow::Context;
 use clap::Parser;
 use cli::{Cli, SubCmd};
 use core::str;
-use decode::decode_bencoded_value;
-use rand::RngCore;
+use decode::{decode, Decoded};
+use peer::PeerHandler;
+use rand::{Rng, RngCore};
 use reqwest::blocking as reqwest;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -16,6 +17,7 @@ use std::{
 
 pub mod cli;
 pub mod decode;
+pub mod peer;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PeersResponse {
@@ -68,7 +70,7 @@ where
     )
 }
 
-fn get_peers(data: Torrent, info_hash: [u8; 20]) -> anyhow::Result<Vec<SocketAddr>> {
+fn get_peers(data: &Torrent, info_hash: [u8; 20]) -> anyhow::Result<Vec<SocketAddr>> {
     let mut url = Url::from_str(&data.announce)?;
     url.query_pairs_mut()
         .append_pair("info_hash", unsafe { str::from_utf8_unchecked(&info_hash) })
@@ -80,38 +82,16 @@ fn get_peers(data: Torrent, info_hash: [u8; 20]) -> anyhow::Result<Vec<SocketAdd
         .append_pair("compact", "1");
     let res = reqwest::get(url)?;
     let text = res.bytes()?;
-    let (_, res) = decode_bencoded_value(&text).unwrap();
+    let (_, res) = decode(&text).unwrap();
     let res: PeersResponse = serde(&res)?;
 
     Ok(res.peers().collect())
 }
 
-fn perform_handshake(addr: SocketAddr, info_hash: [u8; 20]) -> anyhow::Result<[u8; 20]> {
-    let mut tcp = TcpStream::connect(addr)?;
-    let prot_str = b"BitTorrent protocol";
-    tcp.write_all(&[prot_str.len() as u8])?;
-    tcp.write_all(prot_str)?;
-    tcp.write_all(&[0; 8])?;
-    tcp.write_all(&info_hash)?;
-    let mut my_id = [0; 20];
-    rand::thread_rng().fill_bytes(&mut my_id);
-    tcp.write_all(&my_id)?;
-    eprintln!("my_id = {:02x?}", my_id);
-
-    let mut buf = [0; 20];
-    tcp.read_exact(&mut buf)?;
-    assert_eq!(buf[0], 19);
-    assert_eq!(buf[1..], *prot_str);
-    let mut buf = [0; 8];
-    tcp.read_exact(&mut buf)?;
-    let mut buf = [0; 20];
-    tcp.read_exact(&mut buf)?;
-    assert_eq!(&buf[..], &info_hash[..]);
-    let mut peer_id = [0; 20];
-    tcp.read_exact(&mut peer_id)?;
-    eprintln!("Peer ID: {}", hex::encode(peer_id));
-
-    Ok(peer_id)
+fn get_info_hash(value: &Decoded<'_>) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(value["info"].source.unwrap());
+    hasher.finalize().into()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -119,20 +99,20 @@ fn main() -> anyhow::Result<()> {
 
     match cli.subcommand {
         SubCmd::Decode { string } => {
-            let (_, value) = decode_bencoded_value(&string.as_bytes()).unwrap();
+            let (_, value) = decode(&string.as_bytes()).unwrap();
             println!("{}", serde_json::to_string(&value)?);
+            let mut vec = Vec::new();
+            value.encode(&mut vec)?;
+            eprintln!("{}", std::str::from_utf8(&vec)?);
         }
-        SubCmd::Info { path } => {
+        SubCmd::Info { torrent_file: path } => {
             let file = std::fs::read(path)?;
-            let (_, value) = decode_bencoded_value(&file).unwrap();
-
+            let (_, value) = decode(&file).unwrap();
+            let info_hash = get_info_hash(&value);
             let data: Torrent = serde(&value)?;
 
             println!("Tracker URL: {}", data.announce);
             println!("Length: {}", data.info.length);
-            let mut hasher = Sha1::new();
-            hasher.update(value["info"].source);
-            let info_hash = hasher.finalize();
             println!("Info Hash: {}", hex::encode(info_hash));
             println!("Piece Length: {}", data.info.piece_length);
             println!("Piece Hashes:");
@@ -140,17 +120,15 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", hex::encode(piece));
             }
         }
-        SubCmd::Peers { path } => {
+        SubCmd::Peers { torrent_file: path } => {
             let file = std::fs::read(path)?;
-            let (_, value) = decode_bencoded_value(&file).unwrap();
+            let (_, value) = decode(&file).unwrap();
 
             let data: Torrent = serde(&value)?;
+            let info_hash = get_info_hash(&value);
 
             eprintln!("Tracker URL: {}", data.announce);
             eprintln!("Length: {}", data.info.length);
-            let mut hasher = Sha1::new();
-            hasher.update(value["info"].source);
-            let info_hash = hasher.finalize();
             eprintln!("Info Hash: {}", hex::encode(info_hash));
             eprintln!("Piece Length: {}", data.info.piece_length);
             eprintln!("Piece Hashes:");
@@ -158,26 +136,44 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("{}", hex::encode(piece));
             }
 
-            let peers = get_peers(data, info_hash.into())?;
+            let peers = get_peers(&data, info_hash.into())?;
 
             for peer in peers {
                 println!("{}", peer);
             }
         }
-        SubCmd::Handshake { path, addr } => {
+        SubCmd::Handshake {
+            torrent_file: path,
+            addr,
+        } => {
             let file = std::fs::read(path)?;
-            let (_, value) = decode_bencoded_value(&file).unwrap();
+            let (_, value) = decode(&file).unwrap();
             let data: Torrent = serde(&value)?;
-            let mut hasher = Sha1::new();
-            hasher.update(value["info"].source);
-            let info_hash = hasher.finalize();
+            let info_hash = get_info_hash(&value);
 
             for piece in data.info.pieces() {
                 eprintln!("{}", hex::encode(piece));
             }
 
-            let peer_id = perform_handshake(addr, info_hash.into())?;
-            eprintln!("Peer ID: {}", hex::encode(peer_id));
+            let handler = PeerHandler::connect(addr, data, info_hash);
+            // eprintln!("Peer ID: {}", hex::encode(peer_id));
+        }
+        SubCmd::DownloadPiece {
+            out,
+            torrent_file,
+            index,
+        } => {
+            let file = std::fs::read(torrent_file)?;
+            let (_, value) = decode(&file).unwrap();
+            let data: Torrent = serde(&value)?;
+            let info_hash = get_info_hash(&value);
+
+            let piece = data.info.pieces().nth(index);
+
+            let peers = get_peers(&data, info_hash.into())?;
+            // let peer = peers[rand::thread_rng().gen_range(0..peers.len())];
+
+            let handler = PeerHandler::connect(peers[0], data, info_hash);
         }
     }
     Ok(())

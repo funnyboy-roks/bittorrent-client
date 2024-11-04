@@ -1,5 +1,6 @@
-use std::{collections::HashMap, fmt::Display, ops::Index};
+use std::{collections::HashMap, fmt::Display, io::Write, ops::Index};
 
+use anyhow::{bail, Context};
 use nom::{
     branch::alt,
     bytes::complete::take,
@@ -8,11 +9,13 @@ use nom::{
     sequence::{delimited, terminated, tuple},
     IResult,
 };
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+use crate::serde;
 
 #[derive(Debug, Clone)]
 pub struct Decoded<'a> {
-    pub source: &'a [u8],
+    pub source: Option<&'a [u8]>,
     pub kind: DecodedKind<'a>,
 }
 
@@ -24,7 +27,54 @@ impl Serialize for Decoded<'_> {
         self.kind.serialize(s)
     }
 }
-#[derive(Debug, Clone, Serialize)]
+
+impl<'de> Deserialize<'de> for Decoded<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Decoded {
+            source: None,
+            kind: DecodedKind::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl Decoded<'_> {
+    pub fn encode<W>(&self, writer: &mut W) -> anyhow::Result<()>
+    where
+        W: Write,
+    {
+        match &self.kind {
+            DecodedKind::Bytes(b) => {
+                write!(writer, "{}:", b.len())?;
+                writer.write_all(b)?;
+            }
+            DecodedKind::String(s) => {
+                write!(writer, "{}:{}", s.len(), s)?;
+            }
+            DecodedKind::Int(n) => write!(writer, "i{}e", n)?,
+            DecodedKind::List(l) => {
+                write!(writer, "l")?;
+                for i in l {
+                    i.encode(writer)?;
+                }
+                write!(writer, "e")?;
+            }
+            DecodedKind::Dict(d) => {
+                write!(writer, "d")?;
+                for (k, v) in d {
+                    write!(writer, "{}:{}", k.len(), k)?;
+                    v.encode(writer)?;
+                }
+                write!(writer, "e")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DecodedKind<'a> {
     Bytes(&'a [u8]),
@@ -36,7 +86,10 @@ pub enum DecodedKind<'a> {
 
 impl<'a> DecodedKind<'a> {
     pub fn into_decoded(self, source: &'a [u8]) -> Decoded<'a> {
-        Decoded { source, kind: self }
+        Decoded {
+            source: Some(source),
+            kind: self,
+        }
     }
 }
 
@@ -120,7 +173,7 @@ fn int(encoded: &[u8]) -> IResult<&[u8], Decoded> {
 }
 
 fn list(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
-    let (rest, vec) = delimited(char('l'), many0(decode_bencoded_value), char('e'))(encoded)?;
+    let (rest, vec) = delimited(char('l'), many0(decode), char('e'))(encoded)?;
     let slice = encoded
         .strip_suffix(rest)
         .expect("rest is the end of `encoded`");
@@ -128,7 +181,7 @@ fn list(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
 }
 
 fn dict_entry(encoded: &[u8]) -> IResult<&[u8], (&str, Decoded<'_>)> {
-    let (rest, (key, value)) = tuple((string, decode_bencoded_value))(encoded)?;
+    let (rest, (key, value)) = tuple((string, decode))(encoded)?;
     let DecodedKind::String(key) = key.kind else {
         panic!("should always be string");
     };
@@ -146,6 +199,27 @@ fn dict(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
     ))
 }
 
-pub fn decode_bencoded_value(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
+pub fn decode(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
     alt((string, int, list, dict))(encoded)
+}
+
+pub fn decode_into<D>(encoded: &[u8]) -> anyhow::Result<D>
+where
+    D: DeserializeOwned,
+{
+    let v = match alt((string, int, list, dict))(encoded) {
+        Ok((_, v)) => v,
+        Err(e) => bail!("Error decoding {:?}", e),
+    };
+    Ok(serde(&v)?)
+}
+
+pub fn encode<W, S>(writer: &mut W, value: S) -> anyhow::Result<()>
+where
+    W: Write,
+    S: Serialize,
+{
+    let string = serde_json::to_string(&value).context("serializing value")?;
+    let decoded: Decoded<'_> = serde_json::from_str(&string).context("deserializing value")?;
+    decoded.encode(writer)
 }
