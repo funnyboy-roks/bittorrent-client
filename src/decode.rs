@@ -1,6 +1,5 @@
 use std::{collections::HashMap, fmt::Display, ops::Index};
 
-use anyhow::{bail, Context};
 use nom::{
     branch::alt,
     bytes::complete::take,
@@ -9,7 +8,7 @@ use nom::{
     sequence::{delimited, terminated, tuple},
     IResult,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub struct Decoded<'a> {

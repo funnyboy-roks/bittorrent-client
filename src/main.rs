@@ -1,19 +1,20 @@
 use ::reqwest::Url;
 use anyhow::Context;
+use clap::Parser;
+use cli::{Cli, SubCmd};
 use core::str;
-use decode::{decode_bencoded_value, Decoded};
+use decode::decode_bencoded_value;
 use rand::RngCore;
 use reqwest::blocking as reqwest;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{
-    env,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
-    path::Path,
     str::FromStr,
 };
 
+pub mod cli;
 pub mod decode;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,15 +115,15 @@ fn perform_handshake(addr: SocketAddr, info_hash: [u8; 20]) -> anyhow::Result<[u
 }
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = env::args().collect();
+    let cli = Cli::parse();
 
-    match &*args[1] {
-        "decode" => {
-            let (_, value) = decode_bencoded_value(&args[2].as_bytes()).unwrap();
+    match cli.subcommand {
+        SubCmd::Decode { string } => {
+            let (_, value) = decode_bencoded_value(&string.as_bytes()).unwrap();
             println!("{}", serde_json::to_string(&value)?);
         }
-        "info" => {
-            let file = std::fs::read(&args[2])?;
+        SubCmd::Info { path } => {
+            let file = std::fs::read(path)?;
             let (_, value) = decode_bencoded_value(&file).unwrap();
 
             let data: Torrent = serde(&value)?;
@@ -139,8 +140,8 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", hex::encode(piece));
             }
         }
-        "peers" => {
-            let file = std::fs::read(&args[2])?;
+        SubCmd::Peers { path } => {
+            let file = std::fs::read(path)?;
             let (_, value) = decode_bencoded_value(&file).unwrap();
 
             let data: Torrent = serde(&value)?;
@@ -163,9 +164,8 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", peer);
             }
         }
-        "handshake" => {
-            let file = std::fs::read(&args[2])?;
-            let addr: SocketAddr = args[3].parse()?;
+        SubCmd::Handshake { path, addr } => {
+            let file = std::fs::read(path)?;
             let (_, value) = decode_bencoded_value(&file).unwrap();
             let data: Torrent = serde(&value)?;
             let mut hasher = Sha1::new();
@@ -178,9 +178,6 @@ fn main() -> anyhow::Result<()> {
 
             let peer_id = perform_handshake(addr, info_hash.into())?;
             eprintln!("Peer ID: {}", hex::encode(peer_id));
-        }
-        command => {
-            panic!("Unknown command '{}'", command)
         }
     }
     Ok(())

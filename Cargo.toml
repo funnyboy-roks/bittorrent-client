@@ -21,7 +21,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.68"                                                  # error handling
 bytes = "1.3.0"                                                    # helps wrap responses from reqwest
-clap = { version = "4.0.32", features = ["derive"]}                # creating a cli
+clap = { version = "4.0.32", features = ["derive"] }                # creating a cli
 hex = "0.4.3"
 nom = "7.1.3"
 rand = "0.8.5"
