@@ -199,6 +199,7 @@ fn dict(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
     ))
 }
 
+// TODO: make this support AsyncRead
 pub fn decode(encoded: &[u8]) -> IResult<&[u8], Decoded<'_>> {
     alt((string, int, list, dict))(encoded)
 }

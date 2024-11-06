@@ -31,6 +31,11 @@ pub enum SubCmd {
         #[clap(short)]
         out: PathBuf,
         torrent_file: PathBuf,
-        index: usize,
+        index: u32,
+    },
+    DownloadFile {
+        #[clap(short)]
+        out: PathBuf,
+        torrent_file: PathBuf,
     },
 }

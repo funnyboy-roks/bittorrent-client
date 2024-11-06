@@ -1,18 +1,23 @@
-use ::reqwest::Url;
 use anyhow::Context;
 use clap::Parser;
 use cli::{Cli, SubCmd};
 use core::str;
 use decode::{decode, Decoded};
-use peer::Client;
-use rand::{Rng, RngCore};
-use reqwest::blocking as reqwest;
+use peer::{Client, Piece};
+use reqwest::Url;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{
-    io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
+    io::SeekFrom,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
     str::FromStr,
+};
+use tokio::{
+    fs::File,
+    io::{AsyncSeek, AsyncSeekExt, AsyncWriteExt},
+    sync::oneshot,
+    task::JoinSet,
 };
 
 pub mod cli;
@@ -40,10 +45,10 @@ impl PeersResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TorrentInfo {
-    pub length: usize,
+    pub length: u32,
     pub name: String,
     #[serde(rename = "piece length")]
-    pub piece_length: usize,
+    pub piece_length: u32,
     pub pieces: Vec<u8>,
 }
 
@@ -59,6 +64,18 @@ pub struct Torrent {
     pub info: TorrentInfo,
 }
 
+impl Torrent {
+    pub async fn read_file<P>(path: P) -> anyhow::Result<([u8; 20], Self)>
+    where
+        P: AsRef<Path>,
+    {
+        let file = tokio::fs::read(path).await?;
+        let (_, value) = decode(&file).unwrap();
+        let info_hash = get_info_hash(&value);
+        Ok((info_hash, serde(&value)?))
+    }
+}
+
 pub fn serde<S, D>(s: &S) -> anyhow::Result<D>
 where
     S: Serialize,
@@ -70,7 +87,7 @@ where
     )
 }
 
-fn get_peers(data: &Torrent, info_hash: [u8; 20]) -> anyhow::Result<Vec<SocketAddr>> {
+async fn get_peers(data: &Torrent, info_hash: [u8; 20]) -> anyhow::Result<Vec<SocketAddr>> {
     let mut url = Url::from_str(&data.announce)?;
     url.query_pairs_mut()
         .append_pair("info_hash", unsafe { str::from_utf8_unchecked(&info_hash) })
@@ -80,8 +97,8 @@ fn get_peers(data: &Torrent, info_hash: [u8; 20]) -> anyhow::Result<Vec<SocketAd
         .append_pair("downloaded", "0")
         .append_pair("left", &data.info.length.to_string())
         .append_pair("compact", "1");
-    let res = reqwest::get(url)?;
-    let text = res.bytes()?;
+    let res = reqwest::get(url).await?;
+    let text = res.bytes().await?;
     let (_, res) = decode(&text).unwrap();
     let res: PeersResponse = serde(&res)?;
 
@@ -94,7 +111,8 @@ fn get_info_hash(value: &Decoded<'_>) -> [u8; 20] {
     hasher.finalize().into()
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.subcommand {
@@ -106,15 +124,12 @@ fn main() -> anyhow::Result<()> {
             eprintln!("{}", std::str::from_utf8(&vec)?);
         }
         SubCmd::DecodeFile { torrent_file: path } => {
-            let file = std::fs::read(path)?;
+            let file = tokio::fs::read(path).await?;
             let (_, value) = decode(&file).unwrap();
             println!("{}", value);
         }
-        SubCmd::Info { torrent_file: path } => {
-            let file = std::fs::read(path)?;
-            let (_, value) = decode(&file).unwrap();
-            let info_hash = get_info_hash(&value);
-            let data: Torrent = serde(&value)?;
+        SubCmd::Info { torrent_file } => {
+            let (info_hash, data) = Torrent::read_file(torrent_file).await?;
 
             println!("Tracker URL: {}", data.announce);
             println!("Length: {}", data.info.length);
@@ -125,12 +140,8 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", hex::encode(piece));
             }
         }
-        SubCmd::Peers { torrent_file: path } => {
-            let file = std::fs::read(path)?;
-            let (_, value) = decode(&file).unwrap();
-
-            let data: Torrent = serde(&value)?;
-            let info_hash = get_info_hash(&value);
+        SubCmd::Peers { torrent_file } => {
+            let (info_hash, data) = Torrent::read_file(torrent_file).await?;
 
             eprintln!("Tracker URL: {}", data.announce);
             eprintln!("Length: {}", data.info.length);
@@ -141,20 +152,14 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("{}", hex::encode(piece));
             }
 
-            let peers = get_peers(&data, info_hash.into())?;
+            let peers = get_peers(&data, info_hash.into()).await?;
 
             for peer in peers {
                 println!("{}", peer);
             }
         }
-        SubCmd::Handshake {
-            torrent_file: path,
-            addr,
-        } => {
-            let file = std::fs::read(path)?;
-            let (_, value) = decode(&file).unwrap();
-            let data: Torrent = serde(&value)?;
-            let info_hash = get_info_hash(&value);
+        SubCmd::Handshake { torrent_file, addr } => {
+            let (info_hash, data) = Torrent::read_file(torrent_file).await?;
 
             for piece in data.info.pieces() {
                 eprintln!("{}", hex::encode(piece));
@@ -168,17 +173,95 @@ fn main() -> anyhow::Result<()> {
             torrent_file,
             index,
         } => {
-            let file = std::fs::read(torrent_file)?;
-            let (_, value) = decode(&file).unwrap();
-            let data: Torrent = serde(&value)?;
-            let info_hash = get_info_hash(&value);
+            let (info_hash, data) = Torrent::read_file(torrent_file).await?;
 
-            let piece = data.info.pieces().nth(index);
+            let piece_length = if data.info.pieces().count() as u32 - 1 == index {
+                data.info.length % data.info.piece_length
+            } else {
+                data.info.piece_length
+            };
 
-            let peers = get_peers(&data, info_hash.into())?;
+            let peers = get_peers(&data, info_hash.into()).await?;
             // let peer = peers[rand::thread_rng().gen_range(0..peers.len())];
 
-            let handler = Client::connect(peers[0], data, info_hash);
+            let mut handler = Client::connect(peers[0], data, info_hash).await?;
+
+            let mut set = JoinSet::new();
+            let mut pieces = Vec::with_capacity(piece_length.div_ceil(2 << 13) as usize);
+            for begin in (0..piece_length).step_by(2 << 13) {
+                let length = std::cmp::min(piece_length - begin, 2 << 13);
+                let piece = Piece {
+                    index,
+                    begin,
+                    length,
+                };
+                eprintln!("Requesting piece {:?}", piece);
+                let (tx, rx) = oneshot::channel();
+                pieces.push((piece, tx));
+                set.spawn(rx);
+            }
+
+            let mut file = File::create(out).await?;
+            if !handler.request_pieces(pieces).await? {
+                while let Some(res) = set.join_next().await {
+                    if let Some(piece) = res?? {
+                        file.seek(SeekFrom::Start(piece.begin.into()))
+                            .await
+                            .context("seeking in file")?;
+                        file.write(&piece.block).await.context("writing in file")?;
+                    }
+                }
+            }
+        }
+        SubCmd::DownloadFile { out, torrent_file } => {
+            let (info_hash, data) = Torrent::read_file(torrent_file).await?;
+
+            let data_piece_length = data.info.piece_length;
+            let peers = get_peers(&data, info_hash.into()).await?;
+            let mut handler = Client::connect(peers[0], data.clone(), info_hash).await?;
+
+            let mut set = JoinSet::new();
+            let mut pieces = Vec::new();
+            for (index, _) in (0..data.info.length)
+                .step_by(data.info.piece_length as usize)
+                .enumerate()
+            {
+                let index = index as u32;
+
+                let piece_length = if data.info.pieces().count() as u32 - 1 == index {
+                    data.info.length % data_piece_length
+                } else {
+                    data.info.piece_length
+                };
+                // let peer = peers[rand::thread_rng().gen_range(0..peers.len())];
+
+                for begin in (0..piece_length).step_by(2 << 13) {
+                    let length = std::cmp::min(piece_length - begin, 2 << 13);
+                    let piece = Piece {
+                        index,
+                        begin,
+                        length,
+                    };
+                    eprintln!("Requesting piece {:?}", piece);
+                    let (tx, rx) = oneshot::channel();
+                    pieces.push((piece, tx));
+                    set.spawn(rx);
+                }
+            }
+
+            let mut file = File::create(&out).await?;
+            if !handler.request_pieces(pieces).await? {
+                while let Some(res) = set.join_next().await {
+                    if let Some(piece) = res?? {
+                        file.seek(SeekFrom::Start(
+                            (piece.begin + piece.index * data_piece_length) as u64,
+                        ))
+                        .await
+                        .context("seeking in file")?;
+                        file.write(&piece.block).await.context("writing in file")?;
+                    }
+                }
+            }
         }
     }
     Ok(())
