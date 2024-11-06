@@ -107,13 +107,13 @@ impl Message {
 }
 
 #[derive(Debug)]
-pub struct PeerHandler {
+pub struct Client {
     stream: TcpStream,
     data: Torrent,
     info_hash: [u8; 20],
 }
 
-impl PeerHandler {
+impl Client {
     pub fn connect(s: SocketAddr, data: Torrent, info_hash: [u8; 20]) -> anyhow::Result<Self> {
         let mut this = Self {
             stream: TcpStream::connect(s)?,
@@ -143,6 +143,8 @@ impl PeerHandler {
         dbg!(msg);
         Ok(this)
     }
+
+    fn download_piece(&mut self, index: usize) -> anyhow::Result<Vec<u8>> {}
 
     fn handshake(&mut self) -> anyhow::Result<[u8; 20]> {
         let prot_str = b"BitTorrent protocol";

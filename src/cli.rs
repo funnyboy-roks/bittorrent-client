@@ -14,6 +14,9 @@ pub enum SubCmd {
     Decode {
         string: String,
     },
+    DecodeFile {
+        torrent_file: PathBuf,
+    },
     Info {
         torrent_file: PathBuf,
     },

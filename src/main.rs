@@ -4,7 +4,7 @@ use clap::Parser;
 use cli::{Cli, SubCmd};
 use core::str;
 use decode::{decode, Decoded};
-use peer::PeerHandler;
+use peer::Client;
 use rand::{Rng, RngCore};
 use reqwest::blocking as reqwest;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -105,6 +105,11 @@ fn main() -> anyhow::Result<()> {
             value.encode(&mut vec)?;
             eprintln!("{}", std::str::from_utf8(&vec)?);
         }
+        SubCmd::DecodeFile { torrent_file: path } => {
+            let file = std::fs::read(path)?;
+            let (_, value) = decode(&file).unwrap();
+            println!("{}", value);
+        }
         SubCmd::Info { torrent_file: path } => {
             let file = std::fs::read(path)?;
             let (_, value) = decode(&file).unwrap();
@@ -155,7 +160,7 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("{}", hex::encode(piece));
             }
 
-            let handler = PeerHandler::connect(addr, data, info_hash);
+            let handler = Client::connect(addr, data, info_hash);
             // eprintln!("Peer ID: {}", hex::encode(peer_id));
         }
         SubCmd::DownloadPiece {
@@ -173,7 +178,7 @@ fn main() -> anyhow::Result<()> {
             let peers = get_peers(&data, info_hash.into())?;
             // let peer = peers[rand::thread_rng().gen_range(0..peers.len())];
 
-            let handler = PeerHandler::connect(peers[0], data, info_hash);
+            let handler = Client::connect(peers[0], data, info_hash);
         }
     }
     Ok(())
